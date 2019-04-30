@@ -363,6 +363,7 @@ func TestParseAllFormatsInOne(t *testing.T) {
 		{ReleaseContainerName, "repo/imageOne", "tagOne"},
 		{"AAA", "repo/imageTwo", "tagTwo"},
 		{"ZZZ", "repo/imageThree", "tagThree"},
+		{"000", "repo/imageFour", "tagFour"},
 	}
 
 	doc := `---
@@ -371,6 +372,9 @@ kind: FluxHelmRelease
 metadata:
   name: test
   namespace: test
+  annotations:
+    ` + ImageRepositoryPrefix + expected[3].name + `: nested.` + expected[3].name + `.customRepository
+    ` + ImageTagPrefix + expected[3].name + `: nested.` + expected[3].name + `.customTag
 spec:
   chartGitPath: test
   values:
@@ -389,6 +393,12 @@ spec:
         tag: ` + expected[2].tag + `
       persistence:
         enabled: false
+
+    #
+    nested:
+      ` + expected[3].name + `:
+        customRepository: ` + expected[3].image + `
+        customTag: ` + expected[3].tag + `
 `
 
 	resources, err := ParseMultidoc([]byte(doc), "test")

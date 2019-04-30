@@ -2,23 +2,34 @@ package resource
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/weaveworks/flux/image"
 	"github.com/weaveworks/flux/resource"
 )
 
-// ReleaseContainerName is the name used when Flux interprets a
-// FluxHelmRelease as having a container with an image, by virtue of
-// having a `values` stanza with an image field:
-//
-// spec:
-//   ...
-//   values:
-//     image: some/image:version
-//
-// The name refers to the source of the image value.
-const ReleaseContainerName = "chart-image"
+const (
+	// ReleaseContainerName is the name used when Flux interprets a
+	// FluxHelmRelease as having a container with an image, by virtue of
+	// having a `values` stanza with an image field:
+	//
+	// spec:
+	//   ...
+	//   values:
+	//     image: some/image:version
+	//
+	// The name refers to the source of the image value.
+	ReleaseContainerName = "chart-image"
+	ImageRepositoryPrefix = "repository.flux.weave.works/"
+	ImageTagPrefix = "tag.flux.weave.works/"
+)
+
+type MappedContainerImage struct {
+	ImagePath string
+	TagPath	  string
+}
 
 // FluxHelmRelease echoes the generated type for the custom resource
 // definition. It's here so we can 1. get `baseObject` in there, and
@@ -47,6 +58,35 @@ func sorted_keys(values map[string]interface{}) []string {
 	return keys
 }
 
+// FindMappedContainerImages
+func FindMappedContainerImages(annotations map[string]string,
+	values map[string]interface{},
+	visit func(string, image.Ref, ImageSetter) error) error {
+	mci := make(map[string]MappedContainerImage)
+	for k, v := range annotations {
+		if strings.HasPrefix(k, ImageRepositoryPrefix) {
+			container := strings.TrimPrefix(k, ImageRepositoryPrefix)
+			i, _ := mci[container]
+			i.ImagePath = v
+			mci[container] = i
+			continue
+		}
+		if strings.HasPrefix(k, ImageTagPrefix) {
+			name := strings.TrimPrefix(k, ImageTagPrefix)
+			i, _ := mci[name]
+			i.TagPath = v
+			mci[name] = i
+			continue
+		}
+	}
+	for k, i := range mci {
+		if image, setter, ok := interpretMappedContainerImage(values, i); ok {
+			visit(k, image, setter)
+		}
+	}
+	return nil
+}
+
 // FindFluxHelmReleaseContainers examines the Values from a
 // FluxHelmRelease (manifest, or cluster resource, or otherwise) and
 // calls visit with each container name and image it finds, as well as
@@ -54,6 +94,8 @@ func sorted_keys(values map[string]interface{}) []string {
 // it cannot interpret the values as specifying images, or if the
 // `visit` function itself returns an error.
 func FindFluxHelmReleaseContainers(values map[string]interface{}, visit func(string, image.Ref, ImageSetter) error) error {
+	// look up image by container name in spec
+	//
 	// an image defined at the top-level is given a standard container name:
 	if image, setter, ok := interpretAsContainer(stringMap(values)); ok {
 		visit(ReleaseContainerName, image, setter)
@@ -89,6 +131,44 @@ type anyMap map[interface{}]interface{}
 
 func (m stringMap) get(k string) (interface{}, bool) { v, ok := m[k]; return v, ok }
 func (m stringMap) set(k string, v interface{})      { m[k] = v }
+func (m stringMap) getPath(path string) (interface{}, bool) {
+	slice := strings.Split(path, ".")
+	rv := reflect.ValueOf(m)
+	for _, k := range slice {
+		for rv.Kind() == reflect.Ptr || rv.Kind() == reflect.Interface {
+			rv = rv.Elem()
+		}
+
+		if rv.Kind() == reflect.Map {
+			rvv := rv.MapIndex(reflect.ValueOf(k))
+			if rvv.Kind() != reflect.Invalid {
+				rv = rvv
+			} else {
+				panic(fmt.Sprintf("%#v", rv.MapKeys()))
+			}
+			continue
+		}
+
+		if rv.Kind() != reflect.Struct {
+			return rv.Kind().String(), false
+		}
+
+		rv = rv.FieldByName(k)
+	}
+
+	if !rv.IsValid() {
+		return nil, false
+	}
+
+	return rv, true
+}
+func (m stringMap) setPath(path string, v interface{}) {
+	if rv, ok := m.getPath(path); ok {
+		if rvm, ok := rv.(reflect.Value); ok {
+			rvm.Set(v.(reflect.Value))
+		}
+	}
+}
 
 func (m anyMap) get(k string) (interface{}, bool) { v, ok := m[k]; return v, ok }
 func (m anyMap) set(k string, v interface{})      { m[k] = v }
@@ -177,18 +257,51 @@ func interpretAsImage(m mapper) (image.Ref, ImageSetter, bool) {
 	return image.Ref{}, nil, false
 }
 
+func interpretMappedContainerImage(values stringMap, aci MappedContainerImage) (image.Ref, ImageSetter, bool) {
+	imageValue, ok := values.getPath(aci.ImagePath)
+	panic(fmt.Sprintf("%#v", imageValue))
+	if !ok {
+		return image.Ref{}, nil, false
+	}
+
+	if img, ok := imageValue.(string); ok {
+		imageRef, err := image.ParseRef(img)
+		if err == nil {
+			var taggy bool
+			if tag, ok := values.getPath(aci.TagPath); ok {
+				if tagStr, ok := tag.(string); ok {
+					taggy = true
+					imageRef.Tag = tagStr
+				}
+			}
+			return imageRef, func(ref image.Ref) {
+				if taggy {
+					values.setPath(aci.ImagePath, ref.Name.String())
+					values.setPath(aci.TagPath, ref.Tag)
+					return
+				}
+				values.setPath(aci.TagPath, ref.String())
+			}, true
+		}
+	}
+
+	return image.Ref{}, nil, false
+}
+
 // Containers returns the containers that are defined in the
 // FluxHelmRelease.
 func (fhr FluxHelmRelease) Containers() []resource.Container {
 	var containers []resource.Container
-	// If there's an error in interpreting, return what we have.
-	_ = FindFluxHelmReleaseContainers(fhr.Spec.Values, func(container string, image image.Ref, _ ImageSetter) error {
+	containerSetter := func(container string, image image.Ref, _ ImageSetter) error {
 		containers = append(containers, resource.Container{
 			Name:  container,
 			Image: image,
 		})
 		return nil
-	})
+	}
+	// If there's an error in interpreting, return what we have.
+	_ = FindFluxHelmReleaseContainers(fhr.Spec.Values, containerSetter)
+	_ = FindMappedContainerImages(fhr.Meta.Annotations, fhr.Spec.Values, containerSetter)
 	return containers
 }
 
@@ -198,13 +311,17 @@ func (fhr FluxHelmRelease) Containers() []resource.Container {
 // get away with a value-typed receiver because we set a map entry.
 func (fhr FluxHelmRelease) SetContainerImage(container string, ref image.Ref) error {
 	found := false
-	if err := FindFluxHelmReleaseContainers(fhr.Spec.Values, func(name string, image image.Ref, setter ImageSetter) error {
+	imageSetter := func(name string, image image.Ref, setter ImageSetter) error {
 		if container == name {
 			setter(ref)
 			found = true
 		}
 		return nil
-	}); err != nil {
+	}
+	if err := FindFluxHelmReleaseContainers(fhr.Spec.Values, imageSetter); err != nil {
+		return err
+	}
+	if err := FindMappedContainerImages(fhr.Meta.Annotations, fhr.Spec.Values, imageSetter); err != nil {
 		return err
 	}
 	if !found {
