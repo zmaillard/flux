@@ -166,15 +166,15 @@ func main() {
 		TLSHostname: *tillerTLSHostname,
 	})
 
-	// The status updater, to keep track the release status for each
-	// HelmRelease. It runs as a separate loop for now.
-	statusUpdater := status.New(ifClient, kubeClient, helmClient, *namespace)
-	go statusUpdater.Loop(shutdown, log.With(logger, "component", "annotator"))
-
 	nsOpt := ifinformers.WithNamespace(*namespace)
 	ifInformerFactory := ifinformers.NewSharedInformerFactoryWithOptions(ifClient, *chartsSyncInterval, nsOpt)
 	fhrInformer := ifInformerFactory.Flux().V1beta1().HelmReleases()
 	go ifInformerFactory.Start(shutdown)
+
+	// The status updater, to keep track the release status for each
+	// HelmRelease. It runs as a separate loop for now.
+	statusUpdater := status.New(ifClient, fhrInformer.Lister(), helmClient)
+	go statusUpdater.Loop(shutdown, log.With(logger, "component", "statusupdater"))
 
 	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "ChartRelease")
 
