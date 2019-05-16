@@ -1,8 +1,15 @@
-FROM alpine:3.9
+FROM ubuntu:19.04
 
 WORKDIR /home/flux
 
-RUN apk add --no-cache openssh ca-certificates tini 'git>=2.12.0' 'gnutls>=3.6.7' gnupg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-client \
+    ca-certificates \
+    tini \
+    git>=2.12.0 \
+    gnutls-bin>=3.6.7 \
+    gnupg \
+  && rm -rf /var/lib/apt/lists/*
 
 # Add git hosts to known hosts file so we can use
 # StrickHostKeyChecking with git+ssh
@@ -35,15 +42,6 @@ ENTRYPOINT [ "/sbin/tini", "--", "fluxd" ]
 COPY --from=quay.io/squaremo/kubeyaml:0.5.2 /usr/lib/kubeyaml /usr/lib/kubeyaml/
 ENV PATH=/bin:/usr/bin:/usr/local/bin:/usr/lib/kubeyaml
 
-# Create minimal nsswitch.conf file to prioritize the usage of /etc/hosts over DNS queries.
-# This resolves the conflict between:
-# * fluxd using netgo for static compilation. netgo reads nsswitch.conf to mimic glibc,
-#   defaulting to prioritize DNS queries over /etc/hosts if nsswitch.conf is missing:
-#   https://github.com/golang/go/issues/22846
-# * Alpine not including a nsswitch.conf file. Since Alpine doesn't use glibc
-#   (it uses musl), maintainers argue that the need of nsswitch.conf is a Go bug:
-#   https://github.com/gliderlabs/docker-alpine/issues/367#issuecomment-354316460
-RUN [ ! -e /etc/nsswitch.conf ] && echo 'hosts: files dns' > /etc/nsswitch.conf
 COPY ./kubeconfig /root/.kube/config
 COPY ./fluxd /usr/local/bin/
 
